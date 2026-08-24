@@ -99,6 +99,10 @@ class VisionIntelligenceService:
             return_explainable_image=return_explainable_image
         )
 
+        print("\n========== RAW VISION RUNTIME RESULT ==========")
+        print(vision_result)
+        print("===============================================\n")
+
         processing_times["vision_runtime"] = round(
             time.perf_counter() - start,
             3

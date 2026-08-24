@@ -34,6 +34,9 @@ class SVACSIntelligenceMapper:
         "container ship": "cargo",
         "container vessel": "cargo",
 
+        # Passenger ferry
+        "passenger ferry": "passenger ferry",
+
         # Tankers
         "tanker": "tanker",
         "oil tanker": "tanker",
