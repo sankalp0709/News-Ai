@@ -1,114 +1,16 @@
-# import os
-# import uuid
-# import logging
-# import requests
-
-# logger = logging.getLogger(__name__)
-
-
-# class BucketClient:
-
-#     def __init__(self):
-
-#         self.base_url = os.getenv("BUCKET_URL")
-#         self._last_response_hash = None
-
-#         if not self.base_url:
-#             raise RuntimeError(
-#                 "BUCKET_URL is not configured."
-#             )
-
-#     def get_latest_hash(self):
-
-#         try:
-
-#             response = requests.get(
-#                 f"{self.base_url}/bucket/latest-hash",
-#                 timeout=15
-#             )
-
-#             response.raise_for_status()
-
-#             data = response.json()
-
-#             return data.get("last_hash")
-
-#         except Exception as exc:
-
-#             logger.warning(
-#                 "Unable to fetch latest bucket hash: %s",
-#                 exc
-#             )
-
-#             return None
-
-#     def store_artifact(
-#         self,
-#         canonical_intelligence: dict
-#     ):
-
-#         parent_hash = self.get_latest_hash() or getattr(self, "_last_response_hash", None)
-
-#         bucket_payload = {
-
-#             "artifact_id": str(uuid.uuid4()),
-
-#             "trace_id":
-#                 canonical_intelligence["trace_id"],
-
-#             "timestamp_utc":
-#                 canonical_intelligence["timestamp"],
-
-#             "schema_version":
-#                 canonical_intelligence["schema_version"],
-
-#             "source_module_id":
-#                 "samachar",
-
-#             "artifact_type":
-#                 "canonical_intelligence",
-
-#             "parent_hash":
-#                 parent_hash,
-
-#             "payload":
-#                 canonical_intelligence,
-#         }
-
-#         response = requests.post(
-#             f"{self.base_url}/bucket/artifact",
-#             json=bucket_payload,
-#             timeout=30
-#         )
-
-#         response.raise_for_status()
-
-#         resp_json = response.json()
-
-#         # Cache a returned hash from the artifact response so the next call
-#         # can use it as parent when latest-hash endpoint returns null.
-#         if isinstance(resp_json, dict):
-#             for key in ("parent_hash", "hash", "artifact_hash", "last_hash"):
-#                 if resp_json.get(key):
-#                     self._last_response_hash = resp_json.get(key)
-#                     break
-
-#         logger.info(
-#             "Artifact stored successfully in Bucket."
-#         )
-
-#         return resp_json
-
-
 import os
 import uuid
 import logging
+from threading import Lock
 import requests
 
 logger = logging.getLogger(__name__)
 
 
 class BucketClient:
+
+    _trace_to_artifact = {}
+    _lock = Lock()
 
     def __init__(self):
 
@@ -159,6 +61,69 @@ class BucketClient:
             )
 
             return None
+
+    def get_artifact(self, trace_id: str):
+        """
+        Fetch an artifact from Bucket by trace_id or artifact_id.
+
+        Returns:
+            dict | None:
+                Stored artifact when found.
+                None when Bucket reports 404 or artifact is not found.
+        """
+        if not trace_id:
+            return None
+
+        # Build list of lookup IDs: mapped artifact_id first, then trace_id
+        with self._lock:
+            mapped_artifact_id = self._trace_to_artifact.get(trace_id)
+
+        candidates = []
+        if mapped_artifact_id:
+            candidates.append(mapped_artifact_id)
+        if trace_id not in candidates:
+            candidates.append(trace_id)
+
+        for candidate_id in candidates:
+            try:
+                response = requests.get(
+                    f"{self.base_url}/bucket/artifact/{candidate_id}",
+                    timeout=15
+                )
+
+                if response.status_code == 200:
+                    data = response.json()
+                    logger.info(
+                        "Successfully retrieved artifact for id %s (trace_id: %s)",
+                        candidate_id,
+                        trace_id
+                    )
+                    return data
+                elif response.status_code == 404:
+                    continue
+                else:
+                    response.raise_for_status()
+
+            except requests.exceptions.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    continue
+                logger.warning(
+                    "Unable to fetch artifact from Bucket for id %s: %s",
+                    candidate_id,
+                    exc
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Unable to fetch artifact from Bucket for id %s: %s",
+                    candidate_id,
+                    exc
+                )
+
+        logger.info(
+            "Artifact with trace_id %s not found in Bucket.",
+            trace_id
+        )
+        return None
 
     def _resolve_parent_hash(self):
         """
@@ -225,19 +190,21 @@ class BucketClient:
         """
 
         parent_hash = self._resolve_parent_hash()
+        artifact_id = str(uuid.uuid4())
+        trace_id = canonical_intelligence.get("trace_id")
 
         bucket_payload = {
 
-            "artifact_id": str(uuid.uuid4()),
+            "artifact_id": artifact_id,
 
             "trace_id":
-                canonical_intelligence["trace_id"],
+                trace_id,
 
             "timestamp_utc":
-                canonical_intelligence["timestamp"],
+                canonical_intelligence.get("timestamp"),
 
             "schema_version":
-                canonical_intelligence["schema_version"],
+                canonical_intelligence.get("schema_version"),
 
             "source_module_id":
                 "samachar",
@@ -252,9 +219,16 @@ class BucketClient:
                 canonical_intelligence,
         }
 
+        # Maintain trace_id -> artifact_id reference
+        if trace_id:
+            with self._lock:
+                self._trace_to_artifact[trace_id] = artifact_id
+
         logger.info(
-            "Storing artifact in Bucket. parent_hash=%s",
-            parent_hash
+            "Storing artifact in Bucket. parent_hash=%s artifact_id=%s trace_id=%s",
+            parent_hash,
+            artifact_id,
+            trace_id
         )
 
         response = requests.post(
@@ -274,6 +248,11 @@ class BucketClient:
         # --------------------------------------------------
 
         if isinstance(resp_json, dict):
+
+            resp_artifact_id = resp_json.get("artifact_id")
+            if resp_artifact_id and trace_id:
+                with self._lock:
+                    self._trace_to_artifact[trace_id] = resp_artifact_id
 
             generated_hash = resp_json.get("hash")
 
